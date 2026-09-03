@@ -646,7 +646,8 @@ cmd_merge() {
     fi
 
     if (( backup )); then
-        local bak="${cfg}.$(date -u +%Y%m%dT%H%M%SZ).bak"
+        local bak
+        bak="${cfg}.$(date -u +%Y%m%dT%H%M%SZ).bak"
         cp -p "$cfg" "$bak" || die "merge: could not write backup ${bak}"
         ok "backup: ${bak}"
     fi
