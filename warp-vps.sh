@@ -378,7 +378,7 @@ cmd_generate() {
     local file="warp-account.json" tag="$DEFAULT_TAG" mtu="$DEFAULT_MTU"
     local keepalive="$DEFAULT_KEEPALIVE" endpoint_mode="api" endpoint=""
     local with_ipv6=0 domain_strategy="" kernel_tun=0 with_reserved=1
-    local rules="" full=0 out="" remote_dns=""
+    local rules="" full=0 out="" remote_dns="" all_traffic=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -393,6 +393,7 @@ cmd_generate() {
             --no-reserved)     with_reserved=0; shift ;;
             --remote-dns)      remote_dns="$2"; shift 2 ;;
             --rules)           rules="$2"; shift 2 ;;
+            --all-traffic)     all_traffic=1; shift ;;
             --full)            full=1; shift ;;
             --out|-o)          out="$2"; shift 2 ;;
             *) die "generate: unknown option '$1'" ;;
@@ -479,10 +480,17 @@ cmd_generate() {
               | (if $remoteDNS == null then . else . + {remoteDNS: $remoteDNS} end))
         }')
 
+    [[ -n "$rules" && $all_traffic -eq 1 ]] \
+        && die "generate: --rules and --all-traffic are mutually exclusive"
+
     local result="$outbound"
-    if (( full )) || [[ -n "$rules" ]]; then
+    if (( full )) || [[ -n "$rules" ]] || (( all_traffic )); then
         local rule='null'
-        if [[ -n "$rules" ]]; then
+        if (( all_traffic )); then
+            # A rule with only `network` matches every TCP/UDP connection that
+            # reached it — everything the rules above did not already claim.
+            rule=$(jq -n --arg tag "$tag" '{type:"field", network:"tcp,udp", outboundTag:$tag}')
+        elif [[ -n "$rules" ]]; then
             rule=$(jq -n --arg tag "$tag" --arg csv "$rules" \
                 '{type:"field", domain:($csv | split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length>0))), outboundTag:$tag}')
         fi
@@ -553,13 +561,14 @@ cmd_batch() {
 #    swallows our rule if we append after it, so we insert just above it.
 cmd_merge() {
     local cfg="" acct="warp-account.json" rules="" tag="" backup=1 replace=0
-    local dry=0
+    local dry=0 all_traffic=0
     local -a passthru=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --config|-c)  cfg="$2"; shift 2 ;;
             --account|-a) acct="$2"; shift 2 ;;
             --rules)      rules="$2"; shift 2 ;;
+            --all-traffic) all_traffic=1; shift ;;
             --tag|-t)     tag="$2"; shift 2 ;;
             --no-backup)  backup=0; shift ;;
             --replace)    replace=1; shift ;;
@@ -571,7 +580,10 @@ cmd_merge() {
     need_cmd jq
     [[ -n "$cfg" ]]   || die "merge: --config is required"
     [[ -f "$cfg" ]]   || die "merge: config not found: ${cfg}"
-    [[ -n "$rules" ]] || die "merge: --rules is required (which domains should go through WARP)"
+    [[ -n "$rules" || $all_traffic -eq 1 ]] \
+        || die "merge: pass --rules \"a,b,c\" for selected domains, or --all-traffic for everything"
+    [[ -n "$rules" && $all_traffic -eq 1 ]] \
+        && die "merge: --rules and --all-traffic are mutually exclusive"
     jq -e . "$cfg" >/dev/null 2>&1 || die "merge: ${cfg} is not valid JSON"
 
     local -a gen_args=(--account "$acct")
@@ -594,6 +606,7 @@ cmd_merge() {
         --argjson ob "$outbound" \
         --arg tag "$tag" \
         --arg csv "$rules" \
+        --argjson allTraffic "$all_traffic" \
         '
         def is_catchall:
             # A rule with no selector matches every connection.
@@ -605,8 +618,13 @@ cmd_merge() {
         | .outbounds = ([ .outbounds[] | select(.tag != $tag) ] + [$ob])
         | .routing = (.routing // {})
         | .routing.rules = (.routing.rules // [])
-        | ({type: "field", domain: $domains, outboundTag: $tag}) as $rule
-        | .routing.rules = ([ .routing.rules[] | select(.outboundTag != $tag or (has("domain") | not)) ])
+        | (if $allTraffic == 1
+           then {type: "field", network: "tcp,udp", outboundTag: $tag}
+           else {type: "field", domain: $domains, outboundTag: $tag}
+           end) as $rule
+        # Drop every rule already pointing at our tag so --replace is idempotent
+        # rather than appending a second copy on each run.
+        | .routing.rules = ([ .routing.rules[] | select(.outboundTag != $tag) ])
         | ([ .routing.rules | to_entries[] | select(.value | is_catchall) | .key ] | first) as $cut
         | .routing.rules = (
             if $cut == null
@@ -811,6 +829,8 @@ GENERATE
                               1.1.1.1/1.0.0.1 through the tunnel. Pass "local"
                               to use the node's own Xray DNS instead.
         --rules "a,b,c"   Also emit a routing rule sending these domains to the tag
+        --all-traffic     Emit a catch-all rule instead: everything not already
+                          claimed by an earlier rule goes through the tunnel
         --full            Wrap output as {outbounds:[...], routing:{rules:[...]}}
     -o, --out FILE        Write to FILE instead of stdout
 
@@ -824,7 +844,9 @@ BATCH
 MERGE
     -c, --config FILE     Xray config to edit in place (a .bak is written first)
     -a, --account FILE    Account file
-        --rules "a,b,c"   Domains to send through WARP (required)
+        --rules "a,b,c"   Domains to send through WARP
+        --all-traffic     Send everything through WARP instead of selected domains
+                          (one of --rules / --all-traffic is required)
     -t, --tag TAG         Outbound tag (default: warp)
         --replace         Overwrite an existing outbound with the same tag
         --dry-run         Print the merged config instead of writing it

@@ -165,6 +165,7 @@ HTTP/2. В curl это `--tlsv1.2 --tls-max 1.2 --http1.1`. Не «оптими�
 
 ## Документация
 
+- [docs/profiles.md](docs/profiles.md) — два готовых профиля: весь трафик и только AI
 - [docs/remnawave.md](docs/remnawave.md) — интеграция с панелью и нодами
 - [docs/architecture.md](docs/architecture.md) — как устроен туннель и почему
 - [docs/troubleshooting.md](docs/troubleshooting.md) — что делать, когда не работает

@@ -1,0 +1,73 @@
+{
+  "_comment": [
+    "Домены AI-сервисов для маршрутизации через WARP.",
+    "",
+    "Префикс domain: в Xray — это subdomain-матч: domain:openai.com покрывает",
+    "api.openai.com, cdn.openai.com и так далее, отдельные записи не нужны.",
+    "",
+    "geosite:openai идёт первым как база из domain-list-community; явные домены",
+    "ниже перекрывают его отставание — geosite обновляется вместе с geoip.dat",
+    "на ноде, а новые сервисы появляются быстрее.",
+    "",
+    "Готовая строка для --rules лежит в поле _csv."
+  ],
+
+  "rule": {
+    "type": "field",
+    "domain": [
+      "geosite:openai",
+
+      "domain:openai.com",
+      "domain:chatgpt.com",
+      "domain:oaistatic.com",
+      "domain:oaiusercontent.com",
+      "domain:sora.com",
+
+      "domain:anthropic.com",
+      "domain:claude.ai",
+      "domain:claudeusercontent.com",
+
+      "domain:gemini.google.com",
+      "domain:aistudio.google.com",
+      "domain:generativelanguage.googleapis.com",
+
+      "domain:x.ai",
+      "domain:grok.com",
+
+      "domain:perplexity.ai",
+      "domain:deepseek.com",
+      "domain:mistral.ai",
+      "domain:meta.ai",
+      "domain:copilot.microsoft.com",
+      "domain:githubcopilot.com",
+
+      "domain:huggingface.co",
+      "domain:midjourney.com",
+      "domain:suno.com",
+      "domain:elevenlabs.io",
+      "domain:runwayml.com",
+      "domain:leonardo.ai",
+      "domain:character.ai",
+      "domain:poe.com",
+      "domain:cursor.com",
+      "domain:phind.com"
+    ],
+    "outboundTag": "warp"
+  },
+
+  "_csv": "geosite:openai,domain:openai.com,domain:chatgpt.com,domain:oaistatic.com,domain:oaiusercontent.com,domain:sora.com,domain:anthropic.com,domain:claude.ai,domain:claudeusercontent.com,domain:gemini.google.com,domain:aistudio.google.com,domain:generativelanguage.googleapis.com,domain:x.ai,domain:grok.com,domain:perplexity.ai,domain:deepseek.com,domain:mistral.ai,domain:meta.ai,domain:copilot.microsoft.com,domain:githubcopilot.com,domain:huggingface.co,domain:midjourney.com,domain:suno.com,domain:elevenlabs.io,domain:runwayml.com,domain:leonardo.ai,domain:character.ai,domain:poe.com,domain:cursor.com,domain:phind.com",
+
+  "_notes": {
+    "google": [
+      "Взяты только AI-поддомены Google, не geosite:google целиком.",
+      "Увести весь Google через WARP — это сломать выдачу, карты и YouTube-CDN",
+      "ради Gemini."
+    ],
+    "cloudflare_challenge": [
+      "challenges.cloudflare.com сознательно не включён. ChatGPT показывает",
+      "через него проверку; гнать проверку Cloudflare через сеть Cloudflare",
+      "надёжнее не становится. Если капча начнёт зацикливаться — пробуйте",
+      "добавить, но это первый кандидат на откат."
+    ]
+  }
+}
