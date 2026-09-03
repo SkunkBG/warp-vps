@@ -287,7 +287,8 @@ cmd_register() {
 print_account_summary() {
     local a="$1"
     printf '\n' >&2
-    printf '   %sPlan:%s      %s\n' "$C_GRY" "$C_RST" "$(jq -r 'if .warp_plus then "WARP+" else "free" end' <<< "$a")" >&2
+    printf '   %sPlan:%s      %s\n' "$C_GRY" "$C_RST" \
+        "$(jq -r '.account_type + (if .warp_plus then "  (warp_plus flag set)" else "" end)' <<< "$a")" >&2
     printf '   %sAddress:%s   %s\n' "$C_GRY" "$C_RST" "$(jq -r .address_v4 <<< "$a")" >&2
     printf '   %sEndpoint:%s  %s\n' "$C_GRY" "$C_RST" "$(jq -r .endpoint_host <<< "$a")" >&2
     printf '   %sReserved:%s  %s\n' "$C_GRY" "$C_RST" "$(jq -c .reserved <<< "$a")" >&2
