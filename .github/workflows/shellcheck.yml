@@ -28,3 +28,17 @@ jobs:
           ./warp-vps.sh generate -a tests/fixtures/account.json --no-reserved \
             | jq -e 'has("settings") and (.settings | has("reserved") | not)' > /dev/null
           echo "generator output OK"
+      - name: Smoke test the merge splicer
+        run: |
+          set -euo pipefail
+          cat > /tmp/cfg.json <<'EOF'
+          {"outbounds":[{"tag":"DIRECT","protocol":"freedom"},{"tag":"BLOCK","protocol":"blackhole"}],
+           "routing":{"rules":[{"type":"field","domain":["geosite:private"],"outboundTag":"BLOCK"},
+                               {"type":"field","network":"tcp,udp","outboundTag":"DIRECT"}]}}
+          EOF
+          ./warp-vps.sh merge -c /tmp/cfg.json -a tests/fixtures/account.json             --rules "geosite:openai" --dry-run > /tmp/out.json
+          # The outbound must never become index 0 (that is Xray's default handler),
+          # and the rule must land above the catch-all, not after it.
+          jq -e '.outbounds[0].tag == "DIRECT" and .outbounds[-1].tag == "warp"' /tmp/out.json > /dev/null
+          jq -e '([.routing.rules[].outboundTag] | index("warp")) < ([.routing.rules[].outboundTag] | index("DIRECT"))' /tmp/out.json > /dev/null
+          echo "merge placement OK"

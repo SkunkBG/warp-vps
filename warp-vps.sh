@@ -431,10 +431,15 @@ cmd_generate() {
     local reserved='null'
     (( with_reserved )) && reserved=$(jq -c .reserved <<< "$a")
 
-    # `remoteDNS` resolves names from inside the tunnel. Off by default (Xray's
-    # own DNS stays in charge), but setting it to 1.1.1.1 keeps the lookup and
-    # the connection on the same egress — otherwise a geo-steered CDN answers
-    # for the node's real location and the WARP exit is pointless.
+    # `remoteDNS` picks the resolver this outbound uses for domain targets.
+    #
+    # Omitting it does NOT defer to Xray's DNS module: client.go substitutes
+    # 1.1.1.1 / 1.0.0.1 (+ their v6 forms) and resolves them through the tunnel.
+    # That is usually what you want — lookup and connection share an egress, so a
+    # geo-steered CDN answers for the WARP exit rather than for the node.
+    #
+    # The one special value is "local", which hands resolution back to Xray core
+    # (h.dns.LookupIP) and is the way to reuse a node's own DoH configuration.
     local dns_json='null'
     if [[ -n "$remote_dns" ]]; then
         dns_json=$(jq -cn --arg csv "$remote_dns" \
@@ -531,6 +536,114 @@ cmd_batch() {
             ${passthru[@]+"${passthru[@]}"}
     done
     printf '\n  %s✔%s %d node configs in %s\n\n' "$C_GRN" "$C_RST" "$count" "$dir" >&2
+}
+
+# --- merge --------------------------------------------------------------------
+# Splices the outbound and its routing rule into an existing Xray config.
+#
+# Two properties of Xray make hand-editing risky, and both are guarded here.
+#
+# 1. Unmatched traffic goes to the FIRST outbound. app/proxyman/outbound sets
+#    defaultHandler on the first AddHandler call, and the dispatcher falls back
+#    to it whenever no rule matches. Prepending the WARP outbound therefore
+#    silently reroutes *everything* through WARP. We only ever append.
+#
+# 2. Routing takes the FIRST matching rule, not the most specific one. A config
+#    ending in a catch-all (a rule with no domain/ip/inboundTag/... selector)
+#    swallows our rule if we append after it, so we insert just above it.
+cmd_merge() {
+    local cfg="" acct="warp-account.json" rules="" tag="" backup=1 replace=0
+    local dry=0
+    local -a passthru=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --config|-c)  cfg="$2"; shift 2 ;;
+            --account|-a) acct="$2"; shift 2 ;;
+            --rules)      rules="$2"; shift 2 ;;
+            --tag|-t)     tag="$2"; shift 2 ;;
+            --no-backup)  backup=0; shift ;;
+            --replace)    replace=1; shift ;;
+            --dry-run)    dry=1; shift ;;
+            --)           shift; passthru=("$@"); break ;;
+            *) die "merge: unknown option '$1' (put generate options after --)" ;;
+        esac
+    done
+    need_cmd jq
+    [[ -n "$cfg" ]]   || die "merge: --config is required"
+    [[ -f "$cfg" ]]   || die "merge: config not found: ${cfg}"
+    [[ -n "$rules" ]] || die "merge: --rules is required (which domains should go through WARP)"
+    jq -e . "$cfg" >/dev/null 2>&1 || die "merge: ${cfg} is not valid JSON"
+
+    local -a gen_args=(--account "$acct")
+    [[ -n "$tag" ]] && gen_args+=(--tag "$tag")
+    local outbound
+    outbound=$(cmd_generate "${gen_args[@]}" ${passthru[@]+"${passthru[@]}"})
+    tag=$(jq -r .tag <<< "$outbound")
+
+    # An empty outbounds array would make ours the default handler.
+    local n_out
+    n_out=$(jq '.outbounds // [] | length' "$cfg")
+    (( n_out > 0 )) || die "merge: ${cfg} has no outbounds. Adding ours would make WARP the default route for all traffic — add a direct outbound first."
+
+    if jq -e --arg t "$tag" '[.outbounds[]?.tag] | index($t)' "$cfg" >/dev/null 2>&1; then
+        (( replace )) || die "merge: an outbound tagged '${tag}' already exists in ${cfg}. Pass --replace to overwrite it, or --tag to use a different name."
+    fi
+
+    local merged
+    merged=$(jq \
+        --argjson ob "$outbound" \
+        --arg tag "$tag" \
+        --arg csv "$rules" \
+        '
+        def is_catchall:
+            # A rule with no selector matches every connection.
+            (has("domain") or has("ip") or has("inboundTag") or has("user")
+             or has("source") or has("sourcePort") or has("port")
+             or has("protocol") or has("attrs")) | not;
+
+        ($csv | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $domains
+        | .outbounds = ([ .outbounds[] | select(.tag != $tag) ] + [$ob])
+        | .routing = (.routing // {})
+        | .routing.rules = (.routing.rules // [])
+        | ({type: "field", domain: $domains, outboundTag: $tag}) as $rule
+        | .routing.rules = ([ .routing.rules[] | select(.outboundTag != $tag or (has("domain") | not)) ])
+        | ([ .routing.rules | to_entries[] | select(.value | is_catchall) | .key ] | first) as $cut
+        | .routing.rules = (
+            if $cut == null
+            then .routing.rules + [$rule]
+            else .routing.rules[0:$cut] + [$rule] + .routing.rules[$cut:]
+            end
+          )
+        ' "$cfg") || die "merge: jq failed to splice the config"
+
+    local pos
+    pos=$(jq --arg t "$tag" '[.routing.rules[].outboundTag] | index($t)' <<< "$merged")
+    local total
+    total=$(jq '.routing.rules | length' <<< "$merged")
+
+    if (( dry )); then
+        printf '%s\n' "$merged"
+        return 0
+    fi
+
+    if (( backup )); then
+        local bak="${cfg}.$(date -u +%Y%m%dT%H%M%SZ).bak"
+        cp -p "$cfg" "$bak" || die "merge: could not write backup ${bak}"
+        ok "backup: ${bak}"
+    fi
+
+    # Write via a temp file in the same directory so a full disk or a crash
+    # cannot leave a half-written Xray config behind.
+    local tmp
+    tmp=$(mktemp "${cfg}.XXXXXX") || die "mktemp failed"
+    printf '%s\n' "$merged" > "$tmp"
+    jq -e . "$tmp" >/dev/null || { rm -f "$tmp"; die "merge: produced invalid JSON, ${cfg} left untouched"; }
+    chmod --reference="$cfg" "$tmp" 2>/dev/null || chmod 644 "$tmp"
+    mv "$tmp" "$cfg"
+
+    ok "outbound '${tag}' appended (position $(( n_out + 1 )) of $(( n_out + 1 )))"
+    ok "routing rule inserted at index ${pos} of ${total}"
+    printf '\n  %sRollback:%s restore the .bak file and reload Xray\n\n' "$C_BLD" "$C_RST" >&2
 }
 
 # --- verify -------------------------------------------------------------------
@@ -675,6 +788,7 @@ COMMANDS
     info        Show the saved account's plan, address and endpoint
     generate    Emit the Xray `wireguard` outbound (stdout by default)
     batch       Register N independent accounts — one per node — and emit N outbounds
+    merge       Splice the outbound + routing rule into an existing Xray config
     verify      Stand up a throwaway Xray and prove the outbound really exits via WARP
 
 REGISTER
@@ -693,7 +807,9 @@ GENERATE
         --domain-strategy S   ForceIP | ForceIPv4 | ForceIPv6 | ForceIPv4v6 | ForceIPv6v4
         --kernel-tun      Use the kernel TUN path (faster; needs a privileged container)
         --no-reserved     Omit the `reserved` client_id bytes
-        --remote-dns "a,b"    Resolve names inside the tunnel (e.g. 1.1.1.1)
+        --remote-dns "a,b"    Resolver for this outbound. Default when omitted:
+                              1.1.1.1/1.0.0.1 through the tunnel. Pass "local"
+                              to use the node's own Xray DNS instead.
         --rules "a,b,c"   Also emit a routing rule sending these domains to the tag
         --full            Wrap output as {outbounds:[...], routing:{rules:[...]}}
     -o, --out FILE        Write to FILE instead of stdout
@@ -703,6 +819,16 @@ BATCH
     -d, --out-dir DIR     Output directory (default: ./warp-nodes)
         --prefix NAME     File name prefix (default: node)
         --delay SECS      Pause between registrations (default: 5, avoids 429)
+        -- <generate opts>    Everything after -- is passed to generate
+
+MERGE
+    -c, --config FILE     Xray config to edit in place (a .bak is written first)
+    -a, --account FILE    Account file
+        --rules "a,b,c"   Domains to send through WARP (required)
+    -t, --tag TAG         Outbound tag (default: warp)
+        --replace         Overwrite an existing outbound with the same tag
+        --dry-run         Print the merged config instead of writing it
+        --no-backup       Skip the .bak (not recommended)
         -- <generate opts>    Everything after -- is passed to generate
 
 VERIFY
@@ -731,6 +857,7 @@ main() {
         info)            cmd_info "$@" ;;
         generate|gen)    cmd_generate "$@" ;;
         batch)           cmd_batch "$@" ;;
+        merge)           cmd_merge "$@" ;;
         verify|test)     cmd_verify "$@" ;;
         version|--version|-v) printf 'warp-vps %s\n' "$VERSION" ;;
         help|--help|-h)  usage ;;
