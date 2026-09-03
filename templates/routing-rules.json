@@ -1,0 +1,47 @@
+{
+  "_comment": [
+    "Готовые правила маршрутизации. Вставляются в routing.rules конфига Xray.",
+    "ВАЖНО: любое из этих правил должно стоять ВЫШЕ catch-all правила,",
+    "отправляющего трафик в direct — Xray применяет первое совпавшее правило,",
+    "а не самое специфичное.",
+    "outboundTag должен совпадать с тегом, заданным при generate --tag."
+  ],
+
+  "ai": {
+    "type": "field",
+    "domain": [
+      "geosite:openai",
+      "domain:chatgpt.com",
+      "domain:claude.ai",
+      "domain:anthropic.com",
+      "domain:perplexity.ai",
+      "domain:gemini.google.com"
+    ],
+    "outboundTag": "warp"
+  },
+
+  "streaming": {
+    "type": "field",
+    "domain": [
+      "geosite:netflix",
+      "geosite:disney",
+      "geosite:hbo",
+      "geosite:spotify"
+    ],
+    "outboundTag": "warp"
+  },
+
+  "google": {
+    "type": "field",
+    "domain": [
+      "geosite:google"
+    ],
+    "outboundTag": "warp"
+  },
+
+  "everything_else_stays_direct": {
+    "type": "field",
+    "network": "tcp,udp",
+    "outboundTag": "direct"
+  }
+}

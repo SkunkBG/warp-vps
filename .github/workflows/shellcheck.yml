@@ -1,0 +1,30 @@
+name: shellcheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y shellcheck
+      - name: Lint
+        run: shellcheck --severity=warning warp-vps.sh
+      - name: Smoke test the generator against a fixture account
+        run: |
+          set -euo pipefail
+          ./warp-vps.sh generate -a tests/fixtures/account.json | jq -e '
+            .protocol == "wireguard"
+            and (.settings.reserved | length) == 3
+            and .settings.mtu == 1280
+            and .settings.noKernelTun == true
+          ' > /dev/null
+          ./warp-vps.sh generate -a tests/fixtures/account.json --ipv6 --full \
+            | jq -e '.outbounds[0].settings.address | length == 2' > /dev/null
+          ./warp-vps.sh generate -a tests/fixtures/account.json --no-reserved \
+            | jq -e 'has("settings") and (.settings | has("reserved") | not)' > /dev/null
+          echo "generator output OK"

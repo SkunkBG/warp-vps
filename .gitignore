@@ -1,0 +1,15 @@
+# WARP account files: WireGuard private key + device bearer token. Never commit.
+*.account.json
+warp-account.json
+warp-nodes/
+
+# Generated Xray fragments may embed the private key.
+*.outbound.json
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*~
+
+# Test fixture holds a throwaway key pair and no real token.
+!tests/fixtures/account.json
