@@ -14,21 +14,29 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y shellcheck
       - name: Lint
         run: shellcheck --severity=warning warp-vps.sh
-      - name: Smoke test the generator against a fixture account
+
+      - name: Outbound is a freedom outbound bound to the interface
         run: |
           set -euo pipefail
-          ./warp-vps.sh generate -a tests/fixtures/account.json | jq -e '
-            .protocol == "wireguard"
-            and (.settings.reserved | length) == 3
-            and .settings.mtu == 1280
-            and .settings.noKernelTun == true
+          ./warp-vps.sh outbound | jq -e '
+            .protocol == "freedom"
+            and .streamSettings.sockopt.interface == "warp"
+            and (has("settings"))
           ' > /dev/null
-          ./warp-vps.sh generate -a tests/fixtures/account.json --ipv6 --full \
-            | jq -e '.outbounds[0].settings.address | length == 2' > /dev/null
-          ./warp-vps.sh generate -a tests/fixtures/account.json --no-reserved \
-            | jq -e 'has("settings") and (.settings | has("reserved") | not)' > /dev/null
-          echo "generator output OK"
-      - name: Smoke test the merge splicer
+          # Nothing secret may end up in a config that gets pasted into a panel.
+          ./warp-vps.sh outbound | grep -qiE 'secretKey|privateKey|reserved' && exit 1
+          echo "outbound OK"
+
+      - name: The built-in "ai" preset matches templates/rules-ai.json
+        run: |
+          set -euo pipefail
+          diff <(./warp-vps.sh outbound --rules ai --full 2>/dev/null | jq -r '.routing.rules[0].domain[]') \
+               <(jq -r '.rule.domain[]' templates/rules-ai.json)
+          diff <(./warp-vps.sh outbound --rules ai --full 2>/dev/null | jq -r '.routing.rules[0].domain | join(",")') \
+               <(jq -r '._csv' templates/rules-ai.json)
+          echo "ai preset in sync"
+
+      - name: Merge never makes warp the default outbound, and beats the catch-all
         run: |
           set -euo pipefail
           cat > /tmp/cfg.json <<'EOF'
@@ -36,17 +44,25 @@ jobs:
            "routing":{"rules":[{"type":"field","domain":["geosite:private"],"outboundTag":"BLOCK"},
                                {"type":"field","network":"tcp,udp","outboundTag":"DIRECT"}]}}
           EOF
-          ./warp-vps.sh merge -c /tmp/cfg.json -a tests/fixtures/account.json             --rules "geosite:openai" --dry-run > /tmp/out.json
-          # The outbound must never become index 0 (that is Xray's default handler),
-          # and the rule must land above the catch-all, not after it.
+          ./warp-vps.sh merge -c /tmp/cfg.json --rules ai --dry-run > /tmp/out.json
+          # Unmatched traffic goes to outbounds[0]; ours must never be it.
           jq -e '.outbounds[0].tag == "DIRECT" and .outbounds[-1].tag == "warp"' /tmp/out.json > /dev/null
+          # Xray takes the first matching rule, so ours must precede the catch-all.
           jq -e '([.routing.rules[].outboundTag] | index("warp")) < ([.routing.rules[].outboundTag] | index("DIRECT"))' /tmp/out.json > /dev/null
+          # --replace must not duplicate the outbound or the rule.
+          ./warp-vps.sh merge -c /tmp/out.json --all-traffic --replace --dry-run \
+            | jq -e '([.outbounds[]|select(.tag=="warp")]|length == 1)
+                     and ([.routing.rules[]|select(.outboundTag=="warp")]|length == 1)' > /dev/null
           echo "merge placement OK"
-      - name: The built-in "ai" preset must match templates/rules-ai.json
+
+      - name: Guards refuse the dangerous cases
         run: |
           set -euo pipefail
-          # The script embeds the list so a curl-piped run needs no repo files;
-          # the template documents it. They must not drift.
-          diff <(./warp-vps.sh generate -a tests/fixtures/account.json --rules ai --full                    | jq -r '.routing.rules[0].domain[]')                <(jq -r '.rule.domain[]' templates/rules-ai.json)
-          diff <(./warp-vps.sh generate -a tests/fixtures/account.json --rules ai --full                    | jq -r '.routing.rules[0].domain | join(",")')                <(jq -r '._csv' templates/rules-ai.json)
-          echo "ai preset in sync"
+          fails=0
+          ! ./warp-vps.sh merge -c /tmp/cfg.json --dry-run           2>/dev/null || fails=1  # no rule selector
+          ! ./warp-vps.sh outbound --rules ai --all-traffic          2>/dev/null || fails=1  # mutually exclusive
+          echo '{"outbounds":[]}' > /tmp/empty.json
+          ! ./warp-vps.sh merge -c /tmp/empty.json --all-traffic --dry-run 2>/dev/null || fails=1
+          mkdir -p /tmp/opt/remnanode && cp /tmp/cfg.json /tmp/opt/remnanode/config.json
+          ! ./warp-vps.sh merge -c /tmp/opt/remnanode/config.json --all-traffic --dry-run 2>/dev/null || fails=1
+          [ "$fails" -eq 0 ] && echo "guards OK"

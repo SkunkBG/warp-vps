@@ -1,65 +1,38 @@
 # warp-vps
 
-**Cloudflare WARP как нативный outbound Xray — без единого изменения на хосте.**
+**Cloudflare WARP как интерфейс хоста — для нод Xray / Remnawave.**
 
-Регистрирует анонимное WARP-устройство напрямую в API Cloudflare и выдаёт готовый
-к вставке `wireguard`-outbound для Xray / Remnawave. Ни `wg-quick`, ни `ip rule`,
-ни `sysctl`, ни `fwmark`, ни root. Туннель живёт внутри процесса Xray.
-
----
-
-## Чем это отличается от host-туннельных решений
-
-Классическая схема (`wgcf` + `wg-quick` + `Table = 51820` + `fwmark 255`) поднимает
-ядерный WireGuard на хосте и заставляет Xray помечать пакеты через `sockopt.mark`.
-Она быстрее на потоке, но тянет за собой хвост требований к хосту.
-
-| | host-туннель | warp-vps |
-|---|---|---|
-| Изменения на хосте | `ip rule`, `sysctl rp_filter`, mangle-правило, systemd-юниты | нет |
-| Права | root на ноде | не нужны |
-| Требования к контейнеру ноды | `cap_add: NET_ADMIN`, `network_mode: host` | нет |
-| Где живёт конфиг | файлы на ноде + конфиг Xray | только конфиг Xray (т.е. в панели) |
-| Выборочно по нодам | надо ходить на каждую ноду | разные конфиг-профили в панели |
-| Скорость | выше (ядерный стек) | ниже (userspace gVisor) |
-| Отладка | четыре слоя: wg → routing → rp_filter → Xray | один слой: Xray |
-
-Практический смысл: если WARP нужен **на части нод**, host-схема заставляет
-администрировать N машин, а эта — переключается в панели.
-
----
-
-## Установка
-
-Одной командой, на ноду:
+Поднимает ядерный WireGuard-интерфейс `warp` с `Table = off`: маршрутов не
+добавляется **ни одного**, маршрутизация хоста не трогается. В туннель уходит
+только то, что явно привязано к интерфейсу — для Xray это `sockopt.interface`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SkunkBG/warp-vps/main/warp-vps.sh -o /usr/local/bin/warp-vps && chmod +x /usr/local/bin/warp-vps
 ```
 
-Скрипт самодостаточен: ни файлов репозитория, ни установки чего-либо в систему
-он не требует. Недостающие `curl` / `jq` / `openssl` доставит сам, если запущен
-от root, а иначе напечатает готовую команду.
-
-Удаление — `rm /usr/local/bin/warp-vps`. Ничего больше в систему не попадает.
-
-## Быстрый старт
-
 ```bash
-warp-vps register --out node-1.account.json
-warp-vps verify   --account node-1.account.json
-warp-vps generate --account node-1.account.json --rules ai --full
+warp-vps install && warp-vps verify --probe ai
 ```
 
-`verify` поднимает одноразовый Xray на loopback-SOCKS и читает через него
-`cdn-cgi/trace` у самого Cloudflare. Пока он не сказал `warp=on`, в продакшен
-конфиг не идёт.
+---
 
-Зависимости: `curl`, `jq`, и `openssl` **или** `wireguard-tools`. Всё.
+## Почему это работает без маршрутов
 
-Требования к ноде: Xray-core с поддержкой `protocol: "wireguard"` и поля
-`noKernelTun` — оно есть во всех релизах начиная с `v24.12.31`. Проверено против
-`v26.3.27`. Версию на ноде смотрите через `xray version`.
+Неочевидная часть схемы. `Table = off` заставляет `wg-quick` не добавлять
+маршруты вообще — `add_route()` выходит на первой же строке. Как тогда пакет
+находит дорогу в туннель?
+
+За счёт намеренного поведения ядра. `net/ipv4/route.c`, ветка, где поиск
+маршрута не удался, а исходящий интерфейс задан:
+
+> *«Apparently, routing tables are wrong. Assume, that the destination is on
+> link. Because we are allowed to send to iface even if it has NO routes and NO
+> assigned addresses. When oif is specified, routing tables are looked up with
+> only one purpose: to catch if destination is gatewayed, rather than direct.»*
+
+То есть сокет, привязанный через `SO_BINDTODEVICE`, уходит в этот интерфейс
+независимо от таблиц маршрутизации. Отсюда все свойства схемы: нечему протечь,
+нечего чинить в `ip rule`, и `rp_filter` не при делах.
 
 ---
 
@@ -67,133 +40,108 @@ warp-vps generate --account node-1.account.json --rules ai --full
 
 | Команда | Что делает |
 |---|---|
-| `register` | Регистрирует новое WARP-устройство, пишет аккаунт в файл (0600) |
-| `refresh` | Перечитывает endpoint / адреса / `client_id` из Cloudflare |
-| `license` | Применяет ключ WARP+ к существующему аккаунту |
-| `info` | Показывает тариф, адрес и endpoint сохранённого аккаунта |
-| `generate` | Печатает `wireguard`-outbound для Xray |
-| `batch` | Регистрирует N независимых аккаунтов — по одному на ноду |
-| `merge` | Вставляет outbound и правило в существующий конфиг Xray (с бэкапом) |
-| `verify` | Доказывает, что outbound реально выходит через WARP |
+| `install` | Регистрирует устройство WARP, пишет интерфейс, поднимает, ставит watchdog |
+| `status` | Интерфейс, handshake, endpoint, трафик и что докладывает Cloudflare |
+| `verify` | Доказывает, что выход идёт через WARP; `--probe ai` проверяет сами сервисы |
+| `rotate` | Переезд на другой endpoint Cloudflare |
+| `outbound` | Печатает outbound Xray (`freedom` + `sockopt.interface`) и правило |
+| `merge` | Вставляет их в существующий конфиг Xray, с бэкапом |
+| `license` | Применяет ключ WARP+ |
+| `update` | Обновляет сам себя |
+| `uninstall` | Убирает интерфейс, watchdog и состояние |
 
-Полный список опций — `./warp-vps.sh help`.
+Полный список опций — `warp-vps help`.
 
 ---
 
-## Интеграция с Remnawave
-
-Подробно — [docs/remnawave.md](docs/remnawave.md). Коротко:
+## Xray
 
 ```bash
-./warp-vps.sh generate -a de-1.account.json \
-  --rules "geosite:openai,geosite:google,domain:chatgpt.com" --full
+warp-vps outbound --rules ai --full
 ```
 
-Полученный `outbounds[]` и `routing.rules[]` вставляются в Xray-конфиг того
-конфиг-профиля, который назначен нужным нодам. Ноды без этого профиля работают
-как раньше — WARP включается выборочно, без захода на сервер.
+```json
+{
+  "tag": "warp",
+  "protocol": "freedom",
+  "settings": { "domainStrategy": "UseIP" },
+  "streamSettings": { "sockopt": { "interface": "warp", "tcpFastOpen": true } }
+}
+```
 
-**Правило маршрутизации должно стоять выше правила, отправляющего трафик в
-`direct`.** Xray применяет первое совпавшее правило, а не самое специфичное.
+Требования к ноде: Xray должен видеть интерфейс, то есть делить сетевое
+пространство имён с хостом (`network_mode: host`), и иметь `CAP_NET_ADMIN` для
+привязки сокета к устройству. У ноды Remnawave это есть по умолчанию.
+
+Подробности вставки в панель — [docs/remnawave.md](docs/remnawave.md).
 
 ---
 
-## Как это работает
+## Чем отличается от других установщиков WARP
 
-```
-клиент ──VLESS/Reality──▶ Xray на ноде
-                            │
-                            ├── routing: домен совпал с правилом? ──нет──▶ freedom (обычный выход)
-                            │
-                            └──да──▶ outbound "warp"  (protocol: wireguard)
-                                        │
-                                        │  WireGuard, инкапсуляция внутри процесса Xray
-                                        ▼
-                                     engage.cloudflareclient.com:2408
-                                        │
-                                        ▼
-                                     Cloudflare WARP ──▶ целевой ресурс
-```
-
-Никакого сетевого интерфейса в системе не появляется: Xray собирает и разбирает
-WireGuard-кадры сам, поверх обычного UDP-сокета.
-
----
-
-## Решения, которые здесь приняты осознанно
-
-### Один WARP-аккаунт на ноду, а не один на всех
-
-`batch` регистрирует независимые аккаунты не для красоты. Две ноды с одной и той
-же парой ключей — это **один и тот же peer** с точки зрения Cloudflare: второй
-handshake вытесняет первый, ноды по очереди выбивают друг друга, и обе при этом
-локально выглядят «подключёнными». Диагностируется мучительно.
-
-### `noKernelTun: true` по умолчанию
-
-Xray умеет два пути: ядерный TUN и userspace-стек gVisor. Ядерный быстрее, но при
-старте пишет `rp_filter` в `/proc/sys`, который в непривилегированном контейнере
-смонтирован read-only — Xray падает с `failed to disable ipv4 rp_filter`.
-Поэтому по умолчанию userspace. `--kernel-tun` включает быстрый путь, если
-контейнер ноды привилегированный.
-
-### MTU 1280, а не 1420
-
-Дефолт Xray — 1420 (`infra/conf/wireguard.go`, `if c.MTU == 0`). Для WARP это
-слишком много: поверх пути провайдера ложится заголовок WireGuard, и крупные
-пакеты начинают теряться. Симптом — мелкие запросы проходят, тяжёлые страницы
-и загрузки виснут. 1280 — минимальный MTU IPv6, проходит везде.
-
-### Только IPv4 по умолчанию
-
-Много где IPv6 у провайдера blackhole'ится. Peer, анонсирующий `::/0` без рабочего
-v6-пути, подвешивает каждое соединение, которое сначала пробует AAAA.
-`--ipv6` включает двойной стек, если он у вас честно работает.
+Схема `Table = off` + `sockopt.interface` не наша — она хорошо известна,
+например по [distillium/warp-native](https://github.com/distillium/warp-native).
+Отличается реализация.
 
 ### `wgcf` не используется
 
-Не из вредности. `wgcf-account.toml` хранит ровно четыре поля — `device_id`,
-`access_token`, `private_key`, `license_key` — а `wgcf generate` пишет профиль без
-`client_id`. То есть **`reserved` из файлов wgcf восстановить нельзя в принципе**,
-а Xray ждёт эти 3 байта. Мы дёргаем тот же API, что и wgcf, и не теряем поле,
-которое он выбрасывает.
+Обычный установщик скачивает бинарь `wgcf` с GitHub, делает `chmod +x` и
+запускает от root — без подписи и без проверки контрольной суммы.
 
-Побочный выигрыш: не нужно качать неподписанный бинарь и запускать его от root.
+Мы обращаемся к тому же API Cloudflare напрямую через `curl`, а пару ключей
+X25519 генерируем локально. Скачивать и исполнять нечего.
 
-### TLS 1.2 ровно
+### `/etc/resolv.conf` не трогается
 
-API Cloudflare отвечает `403 (error 1020)`, если TLS-профиль не совпадает с
-официальным клиентом: у него `MinVersion == MaxVersion == TLS 1.2` и выключен
-HTTP/2. В curl это `--tlsv1.2 --tls-max 1.2 --http1.1`. Не «оптимизируйте» это.
+Распространённый приём — на время установки перезаписать резолвер на 1.1.1.1 и
+вернуть обратно по `trap EXIT`. Если скрипт убьют `SIGKILL` или сервер уйдёт в
+перезагрузку посреди установки, нода останется с чужим DNS навсегда. И это не
+нужно: API прекрасно достигается тем резолвером, который на ноде уже есть.
+
+### Watchdog умеет отступать и менять endpoint
+
+Проверка «интерфейс жив + пинг проходит» пропускает случай, когда туннель
+работает, но выходит уже не через WARP. Мы спрашиваем сам Cloudflare через
+интерфейс: `warp=on` или ничего.
+
+При отказе — экспоненциальный backoff 3 → 30 минут и **смена endpoint**.
+Фиксированный интервал перезапуска при полной блокировке Cloudflare даёт
+сотни рестартов WireGuard в сутки, что само по себе заметная сигнатура, и не
+помогает: если заблокирован конкретный anycast-адрес, помогает только переезд.
+
+### Проверка отвечает на правильный вопрос
+
+`warp-vps verify --probe ai` спрашивает эндпоинты, которые честно отвечают
+`curl`, и показывает, **каким сервис видит ваше соединение**:
+
+```
+https://chatgpt.com/cdn-cgi/trace   200 ip=104.28.211.187 loc=FR warp=on
+https://api.openai.com/v1/models    401 (reached; needs an API key)
+```
+
+Дёргать HTML-корень сайта бесполезно: Cloudflare отбивает `curl` по TLS-отпечатку,
+и `403` там приходит и с домашнего браузерного IP.
 
 ---
 
 ## Безопасность
 
-Файл аккаунта содержит приватный ключ WireGuard и bearer-токен устройства.
-Создаётся под `umask 077` и остаётся `0600`. В git его класть нельзя —
-`.gitignore` уже закрывает `*.account.json` и `warp-nodes/`.
+`/etc/warp-vps/account.json` содержит приватный ключ WireGuard и bearer-токен
+устройства; создаётся под `umask 077`, остаётся `0600`. `/etc/wireguard/warp.conf`
+тоже `0600`.
 
-`register` обращается к внешнему API Cloudflare и создаёт там анонимное
-устройство. Ключ генерируется локально и наружу уходит только публичная половина.
-
-**Отозвать устройство нельзя.** В API Cloudflare нет самоудаления: у
-`/{apiVersion}/reg/{sourceDeviceId}` есть только `GET` и `PATCH`, а
-`DELETE .../account/reg/{boundDeviceId}` работает лишь для *привязанных*
-устройств и на себя отвечает `401`. Практическое следствие: файл аккаунта — это
-бессрочный доступ к туннелю. При выводе ноды из эксплуатации удаляйте файл и
-заводите новый аккаунт для замены; старый ключ просто перестаёт использоваться.
+Отозвать устройство нельзя: в API Cloudflare нет самоудаления —
+у `/{apiVersion}/reg/{sourceDeviceId}` есть только `GET` и `PATCH`. При выводе
+ноды из эксплуатации удаляйте файл и регистрируйте новый аккаунт.
 
 ---
 
 ## Документация
 
-- [docs/profiles.md](docs/profiles.md) — два готовых профиля: весь трафик и только AI
-- [docs/remnawave.md](docs/remnawave.md) — интеграция с панелью и нодами
-- [docs/architecture.md](docs/architecture.md) — как устроен туннель и почему
-- [docs/troubleshooting.md](docs/troubleshooting.md) — что делать, когда не работает
-
----
+- [docs/architecture.md](docs/architecture.md) — как устроено и почему именно так
+- [docs/remnawave.md](docs/remnawave.md) — вставка в панель, порядок правил
+- [docs/profiles.md](docs/profiles.md) — два профиля: весь трафик и только AI
+- [docs/troubleshooting.md](docs/troubleshooting.md) — когда не работает
 
 ## Лицензия
 
