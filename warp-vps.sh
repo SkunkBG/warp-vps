@@ -371,15 +371,22 @@ cmd_info() {
 #     ParsePrefix — so the /32 form used by wgcf profiles is fine.
 #   * `reserved` must be empty or exactly 3 bytes; Build() rejects anything else.
 #   * `mtu` defaults to 1420 when omitted, which is wrong for WARP.
-#   * `noKernelTun` selects the userspace gVisor stack. Default on here: the
-#     kernel-TUN path writes rp_filter under /proc/sys, which is read-only in an
-#     unprivileged container, and Xray fails to start. Kernel TUN is faster —
-#     pass --kernel-tun if the node's container is privileged.
+#   * `noKernelTun` selects the userspace gVisor stack. Default on because the
+#     kernel path needs CAP_NET_ADMIN and writes rp_filter under /proc/sys,
+#     read-only in an unprivileged container. Xray probes the capability itself
+#     (proxy/wireguard/tun_linux.go, KernelTunSupported) and falls back to gVisor
+#     anyway, so this is a guarantee rather than the only thing preventing a
+#     failed start. --kernel-tun asks for the faster path explicitly.
+#
+# Verified against Xray-core v26.3.27, the latest stable. Do NOT port field names
+# from the main branch: `remoteDNS` is on main and in no release, while `workers`
+# is in the release and not on main. An unknown key is silently ignored by Go's
+# JSON decoder, so a wrong name fails as "nothing happened", never as an error.
 cmd_generate() {
     local file="warp-account.json" tag="$DEFAULT_TAG" mtu="$DEFAULT_MTU"
     local keepalive="$DEFAULT_KEEPALIVE" endpoint_mode="api" endpoint=""
     local with_ipv6=0 domain_strategy="" kernel_tun=0 with_reserved=1
-    local rules="" full=0 out="" remote_dns="" all_traffic=0
+    local rules="" full=0 out="" all_traffic=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -392,7 +399,6 @@ cmd_generate() {
             --domain-strategy) domain_strategy="$2"; shift 2 ;;
             --kernel-tun)      kernel_tun=1; shift ;;
             --no-reserved)     with_reserved=0; shift ;;
-            --remote-dns)      remote_dns="$2"; shift 2 ;;
             --rules)           rules="$2"; shift 2 ;;
             --all-traffic)     all_traffic=1; shift ;;
             --full)            full=1; shift ;;
@@ -433,21 +439,6 @@ cmd_generate() {
     local reserved='null'
     (( with_reserved )) && reserved=$(jq -c .reserved <<< "$a")
 
-    # `remoteDNS` picks the resolver this outbound uses for domain targets.
-    #
-    # Omitting it does NOT defer to Xray's DNS module: client.go substitutes
-    # 1.1.1.1 / 1.0.0.1 (+ their v6 forms) and resolves them through the tunnel.
-    # That is usually what you want — lookup and connection share an egress, so a
-    # geo-steered CDN answers for the WARP exit rather than for the node.
-    #
-    # The one special value is "local", which hands resolution back to Xray core
-    # (h.dns.LookupIP) and is the way to reuse a node's own DoH configuration.
-    local dns_json='null'
-    if [[ -n "$remote_dns" ]]; then
-        dns_json=$(jq -cn --arg csv "$remote_dns" \
-            '$csv | split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length>0))')
-    fi
-
     local outbound
     outbound=$(jq -n \
         --arg tag "$tag" \
@@ -461,7 +452,6 @@ cmd_generate() {
         --argjson reserved "$reserved" \
         --arg domainStrategy "$domain_strategy" \
         --argjson noKernelTun "$([[ $kernel_tun -eq 1 ]] && echo false || echo true)" \
-        --argjson remoteDNS "$dns_json" \
         '{
             tag: $tag,
             protocol: "wireguard",
@@ -477,8 +467,7 @@ cmd_generate() {
                 mtu: $mtu,
                 domainStrategy: $domainStrategy,
                 noKernelTun: $noKernelTun
-            } | (if $reserved == null then . else . + {reserved: $reserved} end)
-              | (if $remoteDNS == null then . else . + {remoteDNS: $remoteDNS} end))
+            } | if $reserved == null then . else . + {reserved: $reserved} end)
         }')
 
     [[ -n "$rules" && $all_traffic -eq 1 ]] \
@@ -562,7 +551,7 @@ cmd_batch() {
 #    swallows our rule if we append after it, so we insert just above it.
 cmd_merge() {
     local cfg="" acct="warp-account.json" rules="" tag="" backup=1 replace=0
-    local dry=0 all_traffic=0
+    local dry=0 all_traffic=0 force_path=0
     local -a passthru=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -574,6 +563,7 @@ cmd_merge() {
             --no-backup)  backup=0; shift ;;
             --replace)    replace=1; shift ;;
             --dry-run)    dry=1; shift ;;
+            --force-path) force_path=1; shift ;;
             --)           shift; passthru=("$@"); break ;;
             *) die "merge: unknown option '$1' (put generate options after --)" ;;
         esac
@@ -586,6 +576,17 @@ cmd_merge() {
     [[ -n "$rules" && $all_traffic -eq 1 ]] \
         && die "merge: --rules and --all-traffic are mutually exclusive"
     jq -e . "$cfg" >/dev/null 2>&1 || die "merge: ${cfg} is not valid JSON"
+
+    # On a Remnawave node the Xray config is panel-managed: the node fetches it
+    # and hands it to Xray, so an edit made on the node survives only until the
+    # next sync. It then reverts with no error anywhere, and the operator hunts a
+    # tunnel that "stopped working on its own". Edit an export of the panel
+    # config and paste the result back into the panel instead.
+    case "$(cd "$(dirname "$cfg")" && pwd)/$(basename "$cfg")" in
+        */remnanode/*|*/remnawave/*|*/opt/remnanode*|*/var/lib/remnanode*)
+            (( force_path )) || die "merge: ${cfg} looks like a node's panel-managed config. Edits there are overwritten on the next panel sync. Export the config from the panel, run merge on that copy, paste it back — or pass --force-path if you are certain this file is not panel-managed."
+            warn "Editing a path that looks panel-managed, because --force-path was given" ;;
+    esac
 
     local -a gen_args=(--account "$acct")
     [[ -n "$tag" ]] && gen_args+=(--tag "$tag")
@@ -658,7 +659,30 @@ cmd_merge() {
     tmp=$(mktemp "${cfg}.XXXXXX") || die "mktemp failed"
     printf '%s\n' "$merged" > "$tmp"
     jq -e . "$tmp" >/dev/null || { rm -f "$tmp"; die "merge: produced invalid JSON, ${cfg} left untouched"; }
-    chmod --reference="$cfg" "$tmp" 2>/dev/null || chmod 644 "$tmp"
+
+    # Valid JSON is not a valid Xray config. When an xray binary is around, let
+    # it parse the result before this lands anywhere a restart would pick it up:
+    # `run -test` builds the config and exits without serving.
+    local xb
+    xb=$(command -v xray 2>/dev/null || true)
+    [[ -z "$xb" && -x /usr/local/bin/xray ]] && xb=/usr/local/bin/xray
+    if [[ -n "$xb" ]]; then
+        if "$xb" run -test -c "$tmp" >/dev/null 2>&1; then
+            ok "validated with $("$xb" version 2>/dev/null | head -1)"
+        else
+            printf '%s\n' "$("$xb" run -test -c "$tmp" 2>&1 | tail -5 | sed 's/^/    /')" >&2
+            rm -f "$tmp"
+            die "merge: xray rejected the merged config, ${cfg} left untouched"
+        fi
+    else
+        warn "no xray binary found — merged config checked for JSON validity only"
+    fi
+
+    # Carry the original mode across rather than defaulting to something wider:
+    # this file now holds a WireGuard private key.
+    local mode
+    mode=$(stat -c '%a' "$cfg" 2>/dev/null || stat -f '%Lp' "$cfg" 2>/dev/null || echo 600)
+    chmod "$mode" "$tmp"
     mv "$tmp" "$cfg"
 
     ok "outbound '${tag}' appended (position $(( n_out + 1 )) of $(( n_out + 1 )))"
@@ -827,9 +851,6 @@ GENERATE
         --domain-strategy S   ForceIP | ForceIPv4 | ForceIPv6 | ForceIPv4v6 | ForceIPv6v4
         --kernel-tun      Use the kernel TUN path (faster; needs a privileged container)
         --no-reserved     Omit the `reserved` client_id bytes
-        --remote-dns "a,b"    Resolver for this outbound. Default when omitted:
-                              1.1.1.1/1.0.0.1 through the tunnel. Pass "local"
-                              to use the node's own Xray DNS instead.
         --rules "a,b,c"   Also emit a routing rule sending these domains to the tag
         --all-traffic     Emit a catch-all rule instead: everything not already
                           claimed by an earlier rule goes through the tunnel
@@ -853,6 +874,7 @@ MERGE
         --replace         Overwrite an existing outbound with the same tag
         --dry-run         Print the merged config instead of writing it
         --no-backup       Skip the .bak (not recommended)
+        --force-path      Proceed even though the path looks panel-managed
         -- <generate opts>    Everything after -- is passed to generate
 
 VERIFY
