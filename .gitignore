@@ -13,6 +13,3 @@ warp-nodes/
 
 # Test fixture holds a throwaway key pair and no real token.
 !tests/fixtures/account.json
-
-# Generated node profiles (may embed keys).
-out/
