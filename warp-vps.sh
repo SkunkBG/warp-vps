@@ -571,6 +571,15 @@ cmd_generate() {
     else
         printf '%s\n' "$result"
     fi
+
+    # "--full" reads like "the full config" to anyone who has not read the help,
+    # so say plainly what this is. stderr, so a redirect still gets clean JSON.
+    if (( full )); then
+        printf '\n  %sNote:%s this is a fragment for pasting, not a complete Xray config.\n' \
+            "$C_BLD" "$C_RST" >&2
+        printf '  %sFor a complete config:%s warp-vps merge -c <exported-panel-config.json> -a %s %s\n\n' \
+            "$C_GRY" "$C_RST" "$file" "$([[ $all_traffic -eq 1 ]] && echo '--all-traffic' || echo '--rules ai')" >&2
+    fi
 }
 
 # --- batch --------------------------------------------------------------------
@@ -973,7 +982,10 @@ GENERATE
                           built-in AI service set; anything else is taken literally
         --all-traffic     Emit a catch-all rule instead: everything not already
                           claimed by an earlier rule goes through the tunnel
-        --full            Wrap output as {outbounds:[...], routing:{rules:[...]}}
+        --full            Emit both pieces as {outbounds:[…], routing:{rules:[…]}}.
+                          Still a FRAGMENT to paste into a config, not a whole
+                          Xray config — for that use `merge`, which splices the
+                          fragment into an existing config and prints the result
     -o, --out FILE        Write to FILE instead of stdout
 
 BATCH
@@ -1013,7 +1025,8 @@ VERIFY
 EXAMPLES
     warp-vps register --out de-1.account.json
     warp-vps verify   --account de-1.account.json
-    warp-vps generate --account de-1.account.json --rules "geosite:openai,domain:chatgpt.com" --full
+    warp-vps generate --account de-1.account.json --rules ai --full
+    warp-vps merge -c panel-config.json -a de-1.account.json --all-traffic
     warp-vps batch --count 3 --prefix eu -- --endpoint random
 
 USAGE_EOF

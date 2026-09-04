@@ -8,15 +8,26 @@ outbound в обоих одинаковый.
 | `warp-all` | `{"type":"field","network":"tcp,udp","outboundTag":"warp"}` | всё, что не забрали правила выше |
 | `warp-ai` | `{"type":"field","domain":[…],"outboundTag":"warp"}` | только домены AI-сервисов |
 
-Сборка:
+Сборка. `merge` берёт существующий конфиг и возвращает **целый** конфиг,
+готовый к вставке в панель:
 
 ```bash
 # весь трафик
-./warp-vps.sh merge -c config.json -a node-1.account.json --all-traffic
+warp-vps merge -c panel-config.json -a node-1.account.json --all-traffic
 
 # только AI
-./warp-vps.sh merge -c config.json -a node-1.account.json \
-  --rules "$(jq -r '._csv' templates/rules-ai.json)"
+warp-vps merge -c panel-config.json -a node-1.account.json --rules ai
+```
+
+`panel-config.json` — это выгруженная из панели копия. Не файл на ноде: там
+конфиг панельный и правка не переживёт синхронизацию.
+
+Если нужен не целый конфиг, а только два куска для ручной вставки —
+`generate --full`. Несмотря на название, это **фрагмент**
+(`{outbounds:[…], routing:{rules:[…]}}`), а не готовый конфиг:
+
+```bash
+warp-vps generate -a node-1.account.json --all-traffic --full
 ```
 
 Список доменов и обоснование, что в него не вошло, — в
