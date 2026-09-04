@@ -765,7 +765,7 @@ TRACE_URL="https://cloudflare.com/cdn-cgi/trace"
 
 cmd_verify() {
     local file="warp-account.json" xray_bin="" port="" image="teddysun/xray:latest"
-    local wait_secs=10
+    local wait_secs=10 probe=""
     local -a passthru=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -774,6 +774,7 @@ cmd_verify() {
             --port|-p)    port="$2"; shift 2 ;;
             --image)      image="$2"; shift 2 ;;
             --wait)       wait_secs="$2"; shift 2 ;;
+            --probe)      probe="$2"; shift 2 ;;
             --)           shift; passthru=("$@"); break ;;
             *) die "verify: unknown option '$1' (put generate options after --)" ;;
         esac
@@ -873,6 +874,32 @@ cmd_verify() {
         "$C_GRY" "${direct_ip:-unknown}" "$C_RST" >&2
     printf '   %sLocation:%s   %s\n\n' "$C_GRY" "$C_RST" "${loc:-unknown}" >&2
 
+    # warp=on only proves the packets go through Cloudflare. For the usual
+    # reason to want WARP on a VPN node — a datacenter IP that services refuse —
+    # the question is whether the destination accepts the new address at all, so
+    # probe the real endpoints through the same tunnel.
+    if [[ -n "$probe" ]]; then
+        step "Probing destinations through the tunnel"
+        local url code
+        # shellcheck disable=SC2001  # a plain , -> space split, no array needed
+        for url in $(printf '%s' "$probe" | sed 's/,/ /g'); do
+            [[ "$url" == http*://* ]] || url="https://${url}"
+            # curl already prints 000 via -w when the request fails, so a
+            # `|| echo 000` fallback would concatenate and yield "000000",
+            # which then matches none of the cases below.
+            code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' \
+                     --socks5-hostname "127.0.0.1:${port}" "$url" 2>/dev/null) || true
+            code=${code:-000}
+            case "$code" in
+                2*|3*)   printf '   %s%-34s%s %s%s (reachable)%s\n' "$C_GRY" "$url" "$C_RST" "$C_GRN" "$code" "$C_RST" >&2 ;;
+                403|451) printf '   %s%-34s%s %s%s (refused — IP reputation or a bot check)%s\n' "$C_GRY" "$url" "$C_RST" "$C_RED" "$code" "$C_RST" >&2 ;;
+                000)     printf '   %s%-34s%s %sno answer%s\n' "$C_GRY" "$url" "$C_RST" "$C_RED" "$C_RST" >&2 ;;
+                *)       printf '   %s%-34s%s %s%s%s\n' "$C_GRY" "$url" "$C_RST" "$C_YLW" "$code" "$C_RST" >&2 ;;
+            esac
+        done
+        printf '\n' >&2
+    fi
+
     case "$warp_state" in
         on|plus) ok "Verified — traffic exits through Cloudflare WARP" ;;
         *) die "Tunnel is up but Cloudflare does not see it as WARP (warp=${warp_state:-empty}). The outbound is reaching the internet some other way — do not deploy this." ;;
@@ -946,6 +973,9 @@ VERIFY
         --xray PATH       Xray binary (auto-detected; falls back to docker)
         --image REF       Docker image for the fallback (default: teddysun/xray:latest)
     -p, --port N          Loopback SOCKS port for the probe
+        --probe "a,b"     Also fetch these URLs through the tunnel and report the
+                          status code — warp=on says the packets go through
+                          Cloudflare, not that the destination accepts the IP
         -- <generate opts>    Everything after -- is passed to generate
 
 EXAMPLES
