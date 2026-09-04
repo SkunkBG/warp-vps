@@ -49,6 +49,21 @@ DEFAULT_TAG="warp"
 # Named domain sets usable as `--rules <name>`, so a curl-piped run needs no
 # files from the repository. templates/rules-ai.json carries the same list with
 # the reasoning; the workflow asserts the two never drift apart.
+# Probe targets that answer a bare curl honestly. Deliberately NOT the sites'
+# HTML roots: Cloudflare's bot protection rejects curl on its TLS fingerprint, so
+# https://chatgpt.com returns 403 from a residential browser IP just as readily
+# as from a hosting range — the code says nothing about the address. /cdn-cgi/trace
+# is exempt and additionally reports what the destination sees, and OpenAI's API
+# answers 401 (reached, unauthenticated) rather than 403 when it is not blocking.
+PROBE_AI="https://chatgpt.com/cdn-cgi/trace,https://claude.ai/cdn-cgi/trace,https://api.openai.com/v1/models,https://gemini.google.com"
+
+expand_probe() {
+    case "$1" in
+        ai) printf '%s' "$PROBE_AI" ;;
+        *)  printf '%s' "$1" ;;
+    esac
+}
+
 RULES_AI="geosite:openai,domain:openai.com,domain:chatgpt.com,domain:oaistatic.com,domain:oaiusercontent.com,domain:sora.com,domain:anthropic.com,domain:claude.ai,domain:claudeusercontent.com,domain:gemini.google.com,domain:aistudio.google.com,domain:generativelanguage.googleapis.com,domain:x.ai,domain:grok.com,domain:perplexity.ai,domain:deepseek.com,domain:mistral.ai,domain:meta.ai,domain:copilot.microsoft.com,domain:githubcopilot.com,domain:huggingface.co,domain:midjourney.com,domain:suno.com,domain:elevenlabs.io,domain:runwayml.com,domain:leonardo.ai,domain:character.ai,domain:poe.com,domain:cursor.com,domain:phind.com"
 
 # Expand a preset name; anything else is passed through as a literal list.
@@ -774,7 +789,7 @@ cmd_verify() {
             --port|-p)    port="$2"; shift 2 ;;
             --image)      image="$2"; shift 2 ;;
             --wait)       wait_secs="$2"; shift 2 ;;
-            --probe)      probe="$2"; shift 2 ;;
+            --probe)      probe=$(expand_probe "$2"); shift 2 ;;
             --)           shift; passthru=("$@"); break ;;
             *) die "verify: unknown option '$1' (put generate options after --)" ;;
         esac
@@ -880,21 +895,35 @@ cmd_verify() {
     # probe the real endpoints through the same tunnel.
     if [[ -n "$probe" ]]; then
         step "Probing destinations through the tunnel"
-        local url code
+        local url code body seen
         # shellcheck disable=SC2001  # a plain , -> space split, no array needed
         for url in $(printf '%s' "$probe" | sed 's/,/ /g'); do
             [[ "$url" == http*://* ]] || url="https://${url}"
-            # curl already prints 000 via -w when the request fails, so a
-            # `|| echo 000` fallback would concatenate and yield "000000",
-            # which then matches none of the cases below.
-            code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' \
-                     --socks5-hostname "127.0.0.1:${port}" "$url" 2>/dev/null) || true
+            # curl already prints 000 through -w when the request fails, so a
+            # `|| echo 000` fallback would concatenate into "000000" and match
+            # none of the cases below. Capture, then default the empty value.
+            body=""; seen=""
+            if [[ "$url" == */cdn-cgi/trace ]]; then
+                body=$(curl -s -m 20 -w $'\n%{http_code}' \
+                         --socks5-hostname "127.0.0.1:${port}" "$url" 2>/dev/null) || true
+                code=${body##*$'\n'}
+                # What the destination itself reports about the connection —
+                # the only direct answer to "which address does it see".
+                # grep -E, not sed: BSD sed has no \| alternation in BREs, so a
+                # sed version of this silently returns nothing on macOS.
+                seen=$(printf '%s' "${body%$'\n'*}" | grep -E '^(ip|loc|warp)=' | tr '\n' ' ')
+            else
+                code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' \
+                         --socks5-hostname "127.0.0.1:${port}" "$url" 2>/dev/null) || true
+            fi
             code=${code:-000}
             case "$code" in
-                2*|3*)   printf '   %s%-34s%s %s%s (reachable)%s\n' "$C_GRY" "$url" "$C_RST" "$C_GRN" "$code" "$C_RST" >&2 ;;
-                403|451) printf '   %s%-34s%s %s%s (refused — IP reputation or a bot check)%s\n' "$C_GRY" "$url" "$C_RST" "$C_RED" "$code" "$C_RST" >&2 ;;
-                000)     printf '   %s%-34s%s %sno answer%s\n' "$C_GRY" "$url" "$C_RST" "$C_RED" "$C_RST" >&2 ;;
-                *)       printf '   %s%-34s%s %s%s%s\n' "$C_GRY" "$url" "$C_RST" "$C_YLW" "$code" "$C_RST" >&2 ;;
+                2*|3*)   printf '   %s%-40s%s %s%s%s %s%s%s\n' "$C_GRY" "$url" "$C_RST" "$C_GRN" "$code" "$C_RST" "$C_GRY" "$seen" "$C_RST" >&2 ;;
+                # 401 means the request arrived and was answered by the service.
+                401)     printf '   %s%-40s%s %s401 (reached; needs an API key)%s\n' "$C_GRY" "$url" "$C_RST" "$C_GRN" "$C_RST" >&2 ;;
+                403|451) printf '   %s%-40s%s %s%s (refused)%s\n' "$C_GRY" "$url" "$C_RST" "$C_RED" "$code" "$C_RST" >&2 ;;
+                000)     printf '   %s%-40s%s %sno answer%s\n' "$C_GRY" "$url" "$C_RST" "$C_RED" "$C_RST" >&2 ;;
+                *)       printf '   %s%-40s%s %s%s%s\n' "$C_GRY" "$url" "$C_RST" "$C_YLW" "$code" "$C_RST" >&2 ;;
             esac
         done
         printf '\n' >&2
@@ -973,9 +1002,12 @@ VERIFY
         --xray PATH       Xray binary (auto-detected; falls back to docker)
         --image REF       Docker image for the fallback (default: teddysun/xray:latest)
     -p, --port N          Loopback SOCKS port for the probe
-        --probe "a,b"     Also fetch these URLs through the tunnel and report the
-                          status code — warp=on says the packets go through
-                          Cloudflare, not that the destination accepts the IP
+        --probe SET       Also fetch these URLs through the tunnel and report the
+                          status — warp=on says the packets reach Cloudflare, not
+                          that the destination accepts the address. "ai" expands
+                          to endpoints that answer curl honestly. Do NOT probe a
+                          site's HTML root: Cloudflare rejects curl on its TLS
+                          fingerprint, so 403 there says nothing about your IP
         -- <generate opts>    Everything after -- is passed to generate
 
 EXAMPLES
