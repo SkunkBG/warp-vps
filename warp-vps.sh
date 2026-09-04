@@ -737,12 +737,14 @@ cmd_outbound() {
 #      is inserted above any catch-all rather than after it.
 cmd_merge() {
     local cfg="" rules="" tag="warp" all_traffic=0 backup=1 replace=0 dry=0 force_path=0
+    local strategy="UseIP"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --config|-c)   cfg="$2"; shift 2 ;;
             --rules)       rules=$(expand_rules "$2"); shift 2 ;;
             --all-traffic) all_traffic=1; shift ;;
             --tag|-t)      tag="$2"; shift 2 ;;
+            --domain-strategy) strategy="$2"; shift 2 ;;
             --no-backup)   backup=0; shift ;;
             --replace)     replace=1; shift ;;
             --dry-run)     dry=1; shift ;;
@@ -772,7 +774,7 @@ cmd_merge() {
     fi
 
     local ob merged
-    ob=$(cmd_outbound --tag "$tag")
+    ob=$(cmd_outbound --tag "$tag" --domain-strategy "$strategy")
     merged=$(jq --argjson ob "$ob" --arg tag "$tag" --arg csv "$rules" --argjson all "$all_traffic" '
         def is_catchall:
             (has("domain") or has("ip") or has("inboundTag") or has("user")
@@ -898,6 +900,9 @@ OUTBOUND / MERGE
     -t, --tag TAG         Outbound tag (default: warp)
         --rules SET       Domains through WARP; "ai" is the built-in set
         --all-traffic     Everything not already claimed by an earlier rule
+        --domain-strategy S   UseIP (default) | UseIPv4 | UseIPv6. The tunnel is
+                          IPv4-only, so UseIPv4 is the safe choice when the rule
+                          is a catch-all and the node has working IPv6
         --full            outbound + rule together (a fragment, not a whole config)
     -c, --config FILE     merge only: config to edit in place (a .bak is written)
         --dry-run         merge only: print the result instead of writing
