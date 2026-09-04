@@ -42,3 +42,11 @@ jobs:
           jq -e '.outbounds[0].tag == "DIRECT" and .outbounds[-1].tag == "warp"' /tmp/out.json > /dev/null
           jq -e '([.routing.rules[].outboundTag] | index("warp")) < ([.routing.rules[].outboundTag] | index("DIRECT"))' /tmp/out.json > /dev/null
           echo "merge placement OK"
+      - name: The built-in "ai" preset must match templates/rules-ai.json
+        run: |
+          set -euo pipefail
+          # The script embeds the list so a curl-piped run needs no repo files;
+          # the template documents it. They must not drift.
+          diff <(./warp-vps.sh generate -a tests/fixtures/account.json --rules ai --full                    | jq -r '.routing.rules[0].domain[]')                <(jq -r '.rule.domain[]' templates/rules-ai.json)
+          diff <(./warp-vps.sh generate -a tests/fixtures/account.json --rules ai --full                    | jq -r '.routing.rules[0].domain | join(",")')                <(jq -r '._csv' templates/rules-ai.json)
+          echo "ai preset in sync"

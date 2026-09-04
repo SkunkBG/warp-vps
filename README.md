@@ -29,14 +29,26 @@
 
 ---
 
+## Установка
+
+Одной командой, на ноду:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SkunkBG/warp-vps/main/warp-vps.sh -o /usr/local/bin/warp-vps && chmod +x /usr/local/bin/warp-vps
+```
+
+Скрипт самодостаточен: ни файлов репозитория, ни установки чего-либо в систему
+он не требует. Недостающие `curl` / `jq` / `openssl` доставит сам, если запущен
+от root, а иначе напечатает готовую команду.
+
+Удаление — `rm /usr/local/bin/warp-vps`. Ничего больше в систему не попадает.
+
 ## Быстрый старт
 
 ```bash
-git clone https://github.com/SkunkBG/warp-vps.git
-cd warp-vps
-./warp-vps.sh register --out de-1.account.json
-./warp-vps.sh verify   --account de-1.account.json
-./warp-vps.sh generate --account de-1.account.json
+warp-vps register --out node-1.account.json
+warp-vps verify   --account node-1.account.json
+warp-vps generate --account node-1.account.json --rules ai --full
 ```
 
 `verify` поднимает одноразовый Xray на loopback-SOCKS и читает через него

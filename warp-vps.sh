@@ -46,6 +46,19 @@ DEFAULT_MTU=1280
 DEFAULT_KEEPALIVE=15
 DEFAULT_TAG="warp"
 
+# Named domain sets usable as `--rules <name>`, so a curl-piped run needs no
+# files from the repository. templates/rules-ai.json carries the same list with
+# the reasoning; the workflow asserts the two never drift apart.
+RULES_AI="geosite:openai,domain:openai.com,domain:chatgpt.com,domain:oaistatic.com,domain:oaiusercontent.com,domain:sora.com,domain:anthropic.com,domain:claude.ai,domain:claudeusercontent.com,domain:gemini.google.com,domain:aistudio.google.com,domain:generativelanguage.googleapis.com,domain:x.ai,domain:grok.com,domain:perplexity.ai,domain:deepseek.com,domain:mistral.ai,domain:meta.ai,domain:copilot.microsoft.com,domain:githubcopilot.com,domain:huggingface.co,domain:midjourney.com,domain:suno.com,domain:elevenlabs.io,domain:runwayml.com,domain:leonardo.ai,domain:character.ai,domain:poe.com,domain:cursor.com,domain:phind.com"
+
+# Expand a preset name; anything else is passed through as a literal list.
+expand_rules() {
+    case "$1" in
+        ai) printf '%s' "$RULES_AI" ;;
+        *)  printf '%s' "$1" ;;
+    esac
+}
+
 # --- Output -------------------------------------------------------------------
 if [[ -t 2 ]]; then
     C_RST=$'\e[0m'; C_BLD=$'\e[1m'; C_CYN=$'\e[36m'; C_GRN=$'\e[32m'
@@ -61,6 +74,55 @@ die()  { printf '\n  %s✖ Error:%s %s\n\n' "$C_RED" "$C_RST" "$1" >&2; exit 1; 
 
 need_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed.${2:+ $2}"
+}
+
+# Echo the first supported package manager, or return 1.
+detect_pm() {
+    local pm
+    for pm in apt-get dnf yum zypper pacman apk; do
+        command -v "$pm" >/dev/null 2>&1 && { printf '%s' "$pm"; return 0; }
+    done
+    return 1
+}
+
+pm_install() {
+    local pm="$1"; shift
+    case "$pm" in
+        apt-get) apt-get update -qq >/dev/null 2>&1
+                 DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null 2>&1 ;;
+        dnf)     dnf install -y "$@" >/dev/null 2>&1 ;;
+        yum)     yum install -y "$@" >/dev/null 2>&1 ;;
+        zypper)  zypper --non-interactive --quiet install "$@" >/dev/null 2>&1 ;;
+        pacman)  pacman -Sy --needed --noconfirm "$@" >/dev/null 2>&1 ;;
+        apk)     apk add --no-cache "$@" >/dev/null 2>&1 ;;
+        *)       return 1 ;;
+    esac
+}
+
+# curl and jq are hard requirements; key generation needs openssl or wg. A bare
+# Debian node ships curl and openssl but almost never jq, which is exactly the
+# case that would otherwise stop a one-command run halfway through.
+ensure_deps() {
+    local -a missing=()
+    command -v curl    >/dev/null 2>&1 || missing+=(curl)
+    command -v jq      >/dev/null 2>&1 || missing+=(jq)
+    command -v openssl >/dev/null 2>&1 || command -v wg >/dev/null 2>&1 || missing+=(openssl)
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+
+    local pm
+    pm=$(detect_pm) || die "Missing: ${missing[*]}. No supported package manager found — install them by hand."
+
+    if [[ $EUID -ne 0 ]]; then
+        die "Missing: ${missing[*]}. Install them first, e.g.:  sudo ${pm} install -y ${missing[*]}"
+    fi
+
+    step "Installing missing dependencies (${missing[*]})"
+    pm_install "$pm" "${missing[@]}" || die "Failed to install: ${missing[*]} (via ${pm})"
+    local c
+    for c in "${missing[@]}"; do
+        command -v "$c" >/dev/null 2>&1 || die "'${c}' still missing after install"
+    done
+    ok "dependencies ready"
 }
 
 # --- Primitives ---------------------------------------------------------------
@@ -237,7 +299,7 @@ cmd_register() {
         esac
     done
 
-    need_cmd curl; need_cmd jq
+    ensure_deps
     if [[ -f "$out" && $force -eq 0 ]]; then
         die "${out} already exists. Registering again would orphan the old WARP device — pass --force to overwrite, or --out to write elsewhere."
     fi
@@ -305,7 +367,7 @@ cmd_refresh() {
             *) die "refresh: unknown option '$1'" ;;
         esac
     done
-    need_cmd curl; need_cmd jq
+    ensure_deps
 
     local a resp
     a=$(load_account "$file")
@@ -330,7 +392,7 @@ cmd_license() {
             *) die "license: unknown option '$1'" ;;
         esac
     done
-    need_cmd curl; need_cmd jq
+    ensure_deps
     [[ -n "$key" ]] || die "license: --key is required"
     key=$(printf '%s' "$key" | tr -cd 'a-zA-Z0-9-')
 
@@ -359,7 +421,7 @@ cmd_info() {
             *) die "info: unknown option '$1'" ;;
         esac
     done
-    need_cmd jq
+    ensure_deps
     print_account_summary "$(load_account "$file")"
     printf '\n' >&2
 }
@@ -399,14 +461,14 @@ cmd_generate() {
             --domain-strategy) domain_strategy="$2"; shift 2 ;;
             --kernel-tun)      kernel_tun=1; shift ;;
             --no-reserved)     with_reserved=0; shift ;;
-            --rules)           rules="$2"; shift 2 ;;
+            --rules)           rules=$(expand_rules "$2"); shift 2 ;;
             --all-traffic)     all_traffic=1; shift ;;
             --full)            full=1; shift ;;
             --out|-o)          out="$2"; shift 2 ;;
             *) die "generate: unknown option '$1'" ;;
         esac
     done
-    need_cmd jq
+    ensure_deps
 
     [[ "$mtu" =~ ^[0-9]+$ ]]       || die "generate: --mtu must be a number"
     [[ "$keepalive" =~ ^[0-9]+$ ]] || die "generate: --keepalive must be a number"
@@ -557,7 +619,7 @@ cmd_merge() {
         case "$1" in
             --config|-c)  cfg="$2"; shift 2 ;;
             --account|-a) acct="$2"; shift 2 ;;
-            --rules)      rules="$2"; shift 2 ;;
+            --rules)      rules=$(expand_rules "$2"); shift 2 ;;
             --all-traffic) all_traffic=1; shift ;;
             --tag|-t)     tag="$2"; shift 2 ;;
             --no-backup)  backup=0; shift ;;
@@ -568,7 +630,7 @@ cmd_merge() {
             *) die "merge: unknown option '$1' (put generate options after --)" ;;
         esac
     done
-    need_cmd jq
+    ensure_deps
     [[ -n "$cfg" ]]   || die "merge: --config is required"
     [[ -f "$cfg" ]]   || die "merge: config not found: ${cfg}"
     [[ -n "$rules" || $all_traffic -eq 1 ]] \
@@ -716,7 +778,7 @@ cmd_verify() {
             *) die "verify: unknown option '$1' (put generate options after --)" ;;
         esac
     done
-    need_cmd curl; need_cmd jq
+    ensure_deps
 
     port=${port:-$(( RANDOM % 10000 + 40000 ))}
 
@@ -851,7 +913,8 @@ GENERATE
         --domain-strategy S   ForceIP | ForceIPv4 | ForceIPv6 | ForceIPv4v6 | ForceIPv6v4
         --kernel-tun      Use the kernel TUN path (faster; needs a privileged container)
         --no-reserved     Omit the `reserved` client_id bytes
-        --rules "a,b,c"   Also emit a routing rule sending these domains to the tag
+        --rules SET       Routing rule for these domains. "ai" expands to the
+                          built-in AI service set; anything else is taken literally
         --all-traffic     Emit a catch-all rule instead: everything not already
                           claimed by an earlier rule goes through the tunnel
         --full            Wrap output as {outbounds:[...], routing:{rules:[...]}}
@@ -867,7 +930,8 @@ BATCH
 MERGE
     -c, --config FILE     Xray config to edit in place (a .bak is written first)
     -a, --account FILE    Account file
-        --rules "a,b,c"   Domains to send through WARP
+        --rules SET       Domains to send through WARP. "ai" expands to the
+                          built-in AI service set
         --all-traffic     Send everything through WARP instead of selected domains
                           (one of --rules / --all-traffic is required)
     -t, --tag TAG         Outbound tag (default: warp)
